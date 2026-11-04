@@ -189,7 +189,8 @@ actor GeminiClient {
   /// Do not read OMI_DESKTOP_API_URL directly: Beta must remain on its fixed
   /// development serving endpoint even when an inherited environment is stale.
   static var proxyBaseURL: String {
-    proxyBaseURL(bundleIdentifier: AppBuild.bundleIdentifier)
+    if let override = GeminiProxyOverride.baseURL { return override }  // XAT: local front door
+    return proxyBaseURL(bundleIdentifier: AppBuild.bundleIdentifier)
   }
 
   static func proxyBaseURL(

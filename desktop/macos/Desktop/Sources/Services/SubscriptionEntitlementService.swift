@@ -177,6 +177,7 @@ enum ManagedProactivityDecisionSource {
   }
 
   static func current() async -> SubscriptionEntitlementDecision {
+    if GeminiProxyOverride.isActive { return .allowManagedProactivity }  // XAT: local front door is not Omi's paid proxy
     let pinned = withLock { override }
     if let pinned {
       return await pinned()

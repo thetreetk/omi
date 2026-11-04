@@ -59,7 +59,8 @@ extension APIClient {
     var policy = RequestAuthPolicy.ownerBound(authorization)
     policy.allowsAuthRetry = false  // A logical frame never replays auth/quota failures.
     try validateExpectedOwner(policy)
-    let base = rustBackendURL.hasSuffix("/") ? rustBackendURL : rustBackendURL + "/"
+    var base = rustBackendURL.hasSuffix("/") ? rustBackendURL : rustBackendURL + "/"
+    if path.hasPrefix("v1/proxy/gemini/"), let override = GeminiProxyOverride.baseURL { base = override }  // XAT
     guard let url = URL(string: base + path) else { throw APIError.invalidResponse }
     var request = URLRequest(url: url)
     request.httpMethod = "POST"

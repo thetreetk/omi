@@ -104,6 +104,7 @@ final class ScreenCloudEntitlementService: @unchecked Sendable {
   }
 
   func allowsCloud(_ authorization: RuntimeOwnerAuthorizationSnapshot) -> Bool {
+    if GeminiProxyOverride.isActive { return true }  // XAT: local front door serves the embeddings
     let response = peek(authorization: authorization)
     return ScreenEmbeddingPolicy(
       plan: response?.subscription.plan, status: response?.subscription.status,
