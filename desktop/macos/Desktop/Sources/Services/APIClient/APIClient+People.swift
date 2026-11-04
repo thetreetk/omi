@@ -392,7 +392,7 @@ extension APIClient {
   }
 
   func synthesizeSpeech(request body: TtsSynthesizeRequest) async throws -> Data {
-    let base = rustBackendURL
+    let base = GeminiProxyOverride.baseURL ?? rustBackendURL  // XAT: local Kokoro via the front door
     guard !base.isEmpty, let url = URL(string: base + "v1/tts/synthesize") else {
       throw APIError.invalidResponse
     }
@@ -455,7 +455,7 @@ extension APIClient {
     request body: TtsSynthesizeRequest,
     stallTimeout: TimeInterval = 10
   ) async throws -> AsyncThrowingStream<Data, Error> {
-    let base = rustBackendURL
+    let base = GeminiProxyOverride.baseURL ?? rustBackendURL  // XAT: local Kokoro via the front door
     guard !base.isEmpty, let url = URL(string: base + "v1/tts/synthesize") else {
       throw APIError.invalidResponse
     }
