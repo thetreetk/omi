@@ -1,0 +1,477 @@
+#!/usr/bin/env python3
+"""omi-frontdoor: answers Omi's Gemini-proxy requests from tiers the user controls.
+
+Omi (macOS app, patched with OMI_GEMINI_PROXY_URL) sends every background AI call (screen analysis, memory and
+task extraction, live notes, dictation polish, embeddings, ...) in Gemini `generateContent` / `embedContent` format.
+This service answers them locally, choosing a tier per request:
+
+  sub    the user's Claude subscription, through the Claude Code CLI in lean headless mode (no API key)
+  api    an Anthropic API key (optional; only used when ANTHROPIC_API_KEY is available)
+  local  Ollama (vision + JSON + tools), embeddings via nomic-embed-text padded to Omi's 3072 dimensions
+
+Order per request comes from config (see POLICY). Cheap or background work goes local first, interactive work to the
+subscription first; a sliding-hour cap protects the subscription; any failure falls through to the next tier.
+
+  omi-frontdoor [--listen 127.0.0.1:8790]
+  Config: ~/.config/omi-frontdoor/config.json (optional) and ~/.config/omi-frontdoor/env (KEY=VALUE, mode 600)
+  Logs:   /tmp/omi-frontdoor.log  (sizes, lane, tier, latency; never request content)   Stats: GET /stats
+Python 3.9 compatible, standard library only.
+"""
+import argparse, base64, json, math, os, re, shutil, subprocess, sys, tempfile, threading, time, urllib.error, urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HOME = os.path.expanduser("~")
+CONF_DIR = os.path.join(HOME, ".config", "omi-frontdoor")
+LOG = "/tmp/omi-frontdoor.log"
+
+
+def load_env_file():
+    p = os.path.join(CONF_DIR, "env")
+    if os.path.exists(p):
+        for line in open(p):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+
+
+load_env_file()
+CFG = {
+    "ollama": os.environ.get("FD_OLLAMA", "http://127.0.0.1:11434"),
+    "local_model": os.environ.get("FD_LOCAL_MODEL", "qwen3-vl:30b-a3b-instruct"),
+    "embed_model": os.environ.get("FD_EMBED_MODEL", "nomic-embed-text"),
+    "embed_dim": int(os.environ.get("FD_EMBED_DIM", "3072")),
+    "tts": os.environ.get("FD_TTS", "http://127.0.0.1:8880"),
+    "tts_voice": os.environ.get("FD_TTS_VOICE", "af_heart"),
+    "claude_bin": os.environ.get("FD_CLAUDE_BIN", os.path.join(HOME, ".local", "bin", "claude")),
+    "sub_model_big": os.environ.get("FD_SUB_MODEL", "sonnet"),
+    "sub_model_small": os.environ.get("FD_SUB_MODEL_SMALL", "haiku"),
+    "api_model_big": os.environ.get("FD_API_MODEL", "claude-sonnet-5-5"),
+    "api_model_small": os.environ.get("FD_API_MODEL_SMALL", "claude-haiku-5-5"),
+    "sub_max_per_hour": int(os.environ.get("FD_SUB_MAX_PER_HOUR", "40")),
+    "sub_timeout": int(os.environ.get("FD_SUB_TIMEOUT", "100")),
+    "local_timeout": int(os.environ.get("FD_LOCAL_TIMEOUT", "150")),
+    "keep_warm_secs": int(os.environ.get("FD_KEEP_WARM_SECS", "240")),   # 0 disables; pings Ollama so the model stays loaded
+    "keep_alive": os.environ.get("FD_KEEP_ALIVE", "30m"),
+    "warm_hours": os.environ.get("FD_WARM_HOURS", "7-23"),              # local hours when the model is kept loaded; outside, it may unload
+    # Tier order. Interactive, non-lite work: subscription first. Everything else (background extraction,
+    # maintenance, lite models): local first so the subscription is not spent on routine work.
+    "policy": {
+        "interactive": ["sub", "api", "local"],
+        "background": ["local", "sub", "api"],
+        "tools": ["api", "local"],          # function calling needs native tool support
+    },
+    "local_first_lanes": ["task_dedup", "task_prioritization", "home_suggestions", "focus", "embedding", "screen_synthesis", "dictation"],
+}
+try:
+    CFG.update(json.load(open(os.path.join(CONF_DIR, "config.json"))))
+except (OSError, ValueError):
+    pass
+
+STATS = {"requests": 0, "by_tier": {}, "failures": {}, "started": time.time()}
+SUB_CALLS = []          # timestamps of subscription calls in the last hour
+LOCK = threading.Lock()
+
+
+def log(msg):
+    try:
+        with open(LOG, "a") as f:
+            f.write(time.strftime("%H:%M:%S ") + msg + "\n")
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- Gemini request parsing
+def g(d, *names, default=None):
+    """First present key among snake_case/camelCase names."""
+    for n in names:
+        if isinstance(d, dict) and n in d and d[n] is not None:
+            return d[n]
+    return default
+
+
+def lower_schema(s):
+    """Gemini schemas use OBJECT/STRING; JSON Schema wants lowercase."""
+    if isinstance(s, dict):
+        out = {}
+        for k, v in s.items():
+            if k == "type" and isinstance(v, str):
+                out[k] = v.lower()
+            else:
+                out[k] = lower_schema(v)
+        return out
+    if isinstance(s, list):
+        return [lower_schema(x) for x in s]
+    return s
+
+
+class Req:
+    """Normalized view of one Gemini generateContent request."""
+
+    def __init__(self, body, model, headers):
+        self.model = model
+        self.lane = headers.get("X-Omi-Lane", "")
+        self.workload = headers.get("X-Omi-Workload", "")
+        self.force = headers.get("X-FD-Tier", "")      # testing: pin one tier (sub|api|local)
+        si = g(body, "system_instruction", "systemInstruction")
+        self.system = "\n".join(p.get("text", "") for p in (si or {}).get("parts", []) if isinstance(p, dict))
+        self.turns = []          # [(role, [parts])] role in user/model ; part dicts: text/image/call/response
+        for c in body.get("contents", []):
+            role = "model" if c.get("role") == "model" else "user"
+            parts = []
+            for p in c.get("parts", []):
+                if "text" in p and p["text"] is not None:
+                    parts.append({"text": p["text"]})
+                idata = g(p, "inline_data", "inlineData")
+                if idata:
+                    parts.append({"image": g(idata, "data"), "mime": g(idata, "mime_type", "mimeType", default="image/jpeg")})
+                fc = g(p, "functionCall", "function_call")
+                if fc:
+                    parts.append({"call": fc})
+                fr = g(p, "functionResponse", "function_response")
+                if fr:
+                    parts.append({"response": fr})
+            self.turns.append((role, parts))
+        gc = g(body, "generation_config", "generationConfig", default={}) or {}
+        self.json_mode = g(gc, "response_mime_type", "responseMimeType") == "application/json"
+        sch = g(gc, "response_schema", "responseSchema")
+        self.schema = lower_schema(sch) if sch else None
+        self.max_tokens = g(gc, "max_output_tokens", "maxOutputTokens", default=2048)
+        self.temperature = g(gc, "temperature")
+        tools = body.get("tools") or []
+        self.tools = []
+        for t in tools:
+            for fd in g(t, "function_declarations", "functionDeclarations", default=[]) or []:
+                self.tools.append({"name": fd["name"], "description": fd.get("description", ""),
+                                   "parameters": lower_schema(fd.get("parameters") or {"type": "object", "properties": {}})})
+
+    @property
+    def images(self):
+        return [p for _, parts in self.turns for p in parts if "image" in p]
+
+    @property
+    def is_lite(self):
+        return "lite" in self.model
+
+    def flat_text(self):
+        out = []
+        for role, parts in self.turns:
+            for p in parts:
+                if "text" in p:
+                    out.append(p["text"])
+        return "\n\n".join(out)
+
+
+def gemini_text_response(text, usage=None):
+    return {"candidates": [{"content": {"role": "model", "parts": [{"text": text}]}, "finishReason": "STOP", "index": 0}],
+            "usageMetadata": usage or {"promptTokenCount": 0, "candidatesTokenCount": 0, "totalTokenCount": 0}}
+
+
+def gemini_call_response(calls, text=""):
+    parts = ([{"text": text}] if text else []) + [{"functionCall": {"name": c["name"], "args": c.get("args", {})}} for c in calls]
+    return {"candidates": [{"content": {"role": "model", "parts": parts}, "finishReason": "STOP", "index": 0}],
+            "usageMetadata": {"promptTokenCount": 0, "candidatesTokenCount": 0, "totalTokenCount": 0}}
+
+
+def strip_fences(t):
+    t = t.strip()
+    m = re.match(r"^```(?:json)?\s*(.*?)\s*```$", t, re.S)
+    return m.group(1).strip() if m else t
+
+
+def json_guard(req, text):
+    """When JSON was requested, make sure the reply parses; raise otherwise so the next tier is tried."""
+    if req.json_mode or req.schema:
+        t = strip_fences(text)
+        json.loads(t)
+        return t
+    return text
+
+
+# ---------------------------------------------------------------- tier: subscription (Claude Code CLI, lean)
+def sub_available():
+    if not os.path.exists(CFG["claude_bin"]):
+        return False
+    now = time.time()
+    with LOCK:
+        SUB_CALLS[:] = [t for t in SUB_CALLS if now - t < 3600]
+        return len(SUB_CALLS) < CFG["sub_max_per_hour"]
+
+
+def run_sub(req):
+    if req.tools:
+        raise RuntimeError("subscription tier does not do function calling")
+    tmp = tempfile.mkdtemp(prefix="fd-")
+    try:
+        paths = []
+        for i, im in enumerate(req.images):
+            ext = {"image/png": "png", "image/webp": "webp", "image/jpeg": "jpg"}.get(im["mime"], "jpg")
+            p = os.path.join(tmp, "image%d.%s" % (i + 1, ext))
+            open(p, "wb").write(base64.b64decode(im["image"]))
+            paths.append(p)
+        prompt = req.flat_text()
+        if paths:
+            prompt += "\n\nThe image file(s) referred to above are: " + ", ".join(paths) + ". Read them with the Read tool before answering."
+        if req.schema:
+            prompt += "\n\nReply with ONLY a JSON value matching this JSON Schema, no prose, no code fences:\n" + json.dumps(req.schema)
+        elif req.json_mode:
+            prompt += "\n\nReply with ONLY valid JSON, no prose, no code fences."
+        model = CFG["sub_model_small"] if req.is_lite else CFG["sub_model_big"]
+        cmd = [CFG["claude_bin"], "-p", prompt, "--output-format", "json", "--model", model, "--no-session-persistence",
+               "--system-prompt", req.system or "Answer exactly as instructed.", "--setting-sources", "", "--strict-mcp-config"]
+        if paths:
+            cmd += ["--tools", "Read", "--allowedTools", "Read", "--add-dir", tmp]
+        else:
+            cmd += ["--tools", ""]
+        env = dict(os.environ)
+        env.pop("ANTHROPIC_API_KEY", None)           # force the subscription login
+        with LOCK:
+            SUB_CALLS.append(time.time())
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=CFG["sub_timeout"], cwd=tmp, env=env)
+        out = json.loads(r.stdout)
+        if out.get("is_error") or not isinstance(out.get("result"), str):
+            raise RuntimeError("claude cli error: %s" % str(out.get("result"))[:200])
+        text = json_guard(req, out["result"])
+        u = out.get("usage", {})
+        return gemini_text_response(text, {"promptTokenCount": u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0),
+                                           "candidatesTokenCount": u.get("output_tokens", 0), "totalTokenCount": 0})
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- tier: Anthropic API key
+def api_available():
+    return bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+
+def to_anthropic(req):
+    msgs = []
+    for role, parts in req.turns:
+        content = []
+        for p in parts:
+            if "text" in p:
+                content.append({"type": "text", "text": p["text"]})
+            elif "image" in p:
+                content.append({"type": "image", "source": {"type": "base64", "media_type": p["mime"], "data": p["image"]}})
+            elif "call" in p:
+                content.append({"type": "tool_use", "id": "call_" + p["call"]["name"], "name": p["call"]["name"], "input": p["call"].get("args", {})})
+            elif "response" in p:
+                content.append({"type": "tool_result", "tool_use_id": "call_" + p["response"]["name"],
+                                "content": json.dumps(p["response"].get("response", {}))})
+        if content:
+            msgs.append({"role": "assistant" if role == "model" else "user", "content": content})
+    system = req.system
+    if req.schema:
+        system += "\n\nReply with ONLY a JSON value matching this JSON Schema, no prose, no fences:\n" + json.dumps(req.schema)
+    elif req.json_mode:
+        system += "\n\nReply with ONLY valid JSON, no prose, no fences."
+    body = {"model": CFG["api_model_small"] if req.is_lite else CFG["api_model_big"], "max_tokens": int(req.max_tokens), "messages": msgs}
+    if system.strip():
+        body["system"] = system
+    if req.tools:
+        body["tools"] = [{"name": t["name"], "description": t["description"], "input_schema": t["parameters"]} for t in req.tools]
+    return body
+
+
+def from_anthropic(req, resp):
+    text, calls = "", []
+    for b in resp.get("content", []):
+        if b.get("type") == "text":
+            text += b["text"]
+        elif b.get("type") == "tool_use":
+            calls.append({"name": b["name"], "args": b.get("input", {})})
+    if calls:
+        return gemini_call_response(calls, text)
+    u = resp.get("usage", {})
+    return gemini_text_response(json_guard(req, text), {"promptTokenCount": u.get("input_tokens", 0),
+                                                         "candidatesTokenCount": u.get("output_tokens", 0), "totalTokenCount": 0})
+
+
+def run_api(req):
+    r = urllib.request.Request("https://api.anthropic.com/v1/messages", data=json.dumps(to_anthropic(req)).encode(), method="POST",
+                               headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"], "anthropic-version": "2023-06-01",
+                                        "content-type": "application/json"})
+    return from_anthropic(req, json.load(urllib.request.urlopen(r, timeout=120)))
+
+
+# ---------------------------------------------------------------- tier: local Ollama
+def to_ollama(req):
+    msgs = []
+    if req.system:
+        msgs.append({"role": "system", "content": req.system})
+    for role, parts in req.turns:
+        text = "\n".join(p["text"] for p in parts if "text" in p)
+        imgs = [p["image"] for p in parts if "image" in p]
+        m = {"role": "assistant" if role == "model" else "user", "content": text}
+        if imgs:
+            m["images"] = imgs
+        for p in parts:
+            if "call" in p:
+                m["role"] = "assistant"
+                m["tool_calls"] = [{"function": {"name": p["call"]["name"], "arguments": p["call"].get("args", {})}}]
+            if "response" in p:
+                m = {"role": "tool", "content": json.dumps(p["response"].get("response", {})), "tool_name": p["response"]["name"]}
+        msgs.append(m)
+    body = {"model": CFG["local_model"], "messages": msgs, "stream": False, "think": False, "keep_alive": CFG["keep_alive"],
+            "options": {"num_predict": int(req.max_tokens), "temperature": req.temperature if req.temperature is not None else 0.2,
+                        "repeat_penalty": 1.15}}
+    if req.schema:
+        body["format"] = req.schema
+    elif req.json_mode:
+        body["format"] = "json"
+    if req.tools:
+        body["tools"] = [{"type": "function", "function": t} for t in req.tools]
+    return body
+
+
+def run_local(req):
+    r = urllib.request.Request(CFG["ollama"] + "/api/chat", data=json.dumps(to_ollama(req)).encode(), method="POST",
+                               headers={"Content-Type": "application/json"})
+    resp = json.load(urllib.request.urlopen(r, timeout=CFG["local_timeout"]))
+    msg = resp.get("message", {})
+    calls = [{"name": c["function"]["name"], "args": c["function"].get("arguments", {})} for c in msg.get("tool_calls") or []]
+    if calls:
+        return gemini_call_response(calls, msg.get("content", ""))
+    text = json_guard(req, msg.get("content", ""))
+    return gemini_text_response(text, {"promptTokenCount": resp.get("prompt_eval_count", 0),
+                                       "candidatesTokenCount": resp.get("eval_count", 0), "totalTokenCount": 0})
+
+
+# ---------------------------------------------------------------- embeddings (local, padded to Omi's 3072 dims)
+def embed_texts(texts):
+    r = urllib.request.Request(CFG["ollama"] + "/api/embed", data=json.dumps({"model": CFG["embed_model"], "input": texts}).encode(),
+                               method="POST", headers={"Content-Type": "application/json"})
+    vecs = json.load(urllib.request.urlopen(r, timeout=60))["embeddings"]
+    out = []
+    for v in vecs:
+        v = list(v)[:CFG["embed_dim"]]
+        v += [0.0] * (CFG["embed_dim"] - len(v))        # zero padding keeps cosine similarity unchanged
+        n = math.sqrt(sum(x * x for x in v)) or 1.0
+        out.append([x / n for x in v])
+    return out
+
+
+# ---------------------------------------------------------------- routing
+TIERS = {"sub": (sub_available, run_sub), "api": (api_available, run_api), "local": (lambda: True, run_local)}
+
+
+def order_for(req):
+    if req.force in TIERS:
+        return [req.force]
+    pol = CFG["policy"]
+    if req.tools:
+        return pol["tools"]
+    local_first = req.is_lite or req.workload in ("extraction", "maintenance") or req.lane in CFG["local_first_lanes"]
+    return pol["background"] if local_first else pol["interactive"]
+
+
+def answer(req):
+    errors = []
+    for tier in order_for(req):
+        avail, run = TIERS[tier]
+        if not avail():
+            errors.append("%s unavailable" % tier)
+            continue
+        t0 = time.time()
+        try:
+            resp = run(req)
+            dt = time.time() - t0
+            with LOCK:
+                STATS["by_tier"][tier] = STATS["by_tier"].get(tier, 0) + 1
+            log("ok   tier=%s lane=%s wl=%s model=%s imgs=%d tools=%d json=%s %.1fs" %
+                (tier, req.lane or "-", req.workload or "-", req.model, len(req.images), len(req.tools), bool(req.json_mode or req.schema), dt))
+            return resp, tier
+        except Exception as exc:                       # fall through to the next tier
+            msg = "%s: %s" % (tier, str(exc)[:160])
+            errors.append(msg)
+            with LOCK:
+                STATS["failures"][tier] = STATS["failures"].get(tier, 0) + 1
+            log("fail tier=%s lane=%s %.1fs %s" % (tier, req.lane or "-", time.time() - t0, str(exc)[:200]))
+    raise RuntimeError("; ".join(errors))
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.0"
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, status, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(status); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+
+    def do_GET(self):
+        if self.path.startswith("/stats"):
+            with LOCK:
+                self._send(200, dict(STATS, uptime=int(time.time() - STATS["started"]), sub_calls_last_hour=len(SUB_CALLS), cfg={
+                    k: CFG[k] for k in ("local_model", "embed_model", "sub_max_per_hour", "policy")}))
+        else:
+            self._send(200, {"ok": True, "service": "omi-frontdoor"})
+
+    def tts(self, body):
+        """Omi's cloud TTS route ({text, voice_id, instructions} -> audio/mpeg) answered by local Kokoro."""
+        text = (body.get("text") or "").strip()
+        if not text:
+            return self._send(400, {"error": "empty text"})
+        r = urllib.request.Request(CFG["tts"] + "/v1/audio/speech", method="POST", headers={"Content-Type": "application/json"},
+                                   data=json.dumps({"model": "kokoro", "input": text, "voice": CFG["tts_voice"], "response_format": "mp3"}).encode())
+        t0 = time.time()
+        data = urllib.request.urlopen(r, timeout=60).read()
+        self.send_response(200); self.send_header("Content-Type", "audio/mpeg")
+        self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+        with LOCK:
+            STATS["by_tier"]["tts"] = STATS["by_tier"].get("tts", 0) + 1
+        log("ok   tts chars=%d bytes=%d %.1fs" % (len(text), len(data), time.time() - t0))
+
+    def do_POST(self):
+        try:
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+            if self.path.split("?")[0].rstrip("/").endswith("/v1/tts/synthesize"):
+                return self.tts(body)
+            m = re.search(r"/models/([^:/]+):(\w+)", self.path)
+            if not m:
+                return self._send(404, {"error": {"message": "unsupported path"}})
+            model, action = m.group(1), m.group(2)
+            with LOCK:
+                STATS["requests"] += 1
+            if action == "embedContent":
+                text = "\n".join(p.get("text", "") for p in body.get("content", {}).get("parts", []))
+                return self._send(200, {"embedding": {"values": embed_texts([text])[0]}})
+            if action == "batchEmbedContents":
+                texts = ["\n".join(p.get("text", "") for p in r.get("content", {}).get("parts", [])) for r in body.get("requests", [])]
+                return self._send(200, {"embeddings": [{"values": v} for v in embed_texts(texts)]})
+            if action in ("generateContent", "streamGenerateContent"):
+                resp, tier = answer(Req(body, model, self.headers))
+                return self._send(200, resp)
+            return self._send(404, {"error": {"message": "unsupported action " + action}})
+        except Exception as exc:
+            log("ERROR %s: %r" % (self.path, exc))
+            self._send(502, {"error": {"code": 502, "message": "frontdoor: %s" % str(exc)[:300], "status": "UNAVAILABLE"}})
+
+
+def keep_warm():
+    """Ollama unloads a model after ~5 idle minutes; reloading a 22 GB model costs 10-30 s. Ping it so it stays resident."""
+    while CFG["keep_warm_secs"] > 0:
+        lo, hi = [int(x) for x in CFG["warm_hours"].split("-")]
+        if not (lo <= time.localtime().tm_hour < hi):
+            time.sleep(300)
+            continue
+        try:
+            r = urllib.request.Request(CFG["ollama"] + "/api/generate", method="POST", headers={"Content-Type": "application/json"},
+                                       data=json.dumps({"model": CFG["local_model"], "keep_alive": CFG["keep_alive"], "prompt": ""}).encode())
+            urllib.request.urlopen(r, timeout=120).read()
+        except Exception as exc:
+            log("keep-warm failed: %s" % str(exc)[:120])
+        time.sleep(CFG["keep_warm_secs"])
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--listen", default=os.environ.get("FD_LISTEN", "127.0.0.1:8790"))
+    a = ap.parse_args()
+    host, port = a.listen.rsplit(":", 1)
+    log("omi-frontdoor up on %s local=%s embed=%s sub_cap=%d/h api=%s" % (a.listen, CFG["local_model"], CFG["embed_model"],
+        CFG["sub_max_per_hour"], "yes" if api_available() else "no"))
+    threading.Thread(target=keep_warm, daemon=True).start()
+    ThreadingHTTPServer((host, int(port)), Handler).serve_forever()
